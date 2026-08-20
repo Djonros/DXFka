@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Сборка PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Рабочие артефакты
+*.log
+*.log.*
+license.key
+kompas_dxf_exporter.log*
+
+# Секрет и инструменты разработки — ТОЛЬКО локально, не в репозиторий!
+license_secret.py
+keygen.py
+keygen.bat
+
+# Результаты экспорта и тестовые выходные данные
+DXF_Out/
+test_export/
+test_projections/
+*.dxf
+*.m3d
+export_report.csv
+unique_parts.csv
+
+# Служебное
+Thumbs.db
+Desktop.ini
