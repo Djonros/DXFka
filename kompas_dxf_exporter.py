@@ -5,7 +5,8 @@ DXFka — пакетный экспорт DXF из деталей сборки �
 
 Возможности:
   * выбор файла сборки (.a3d) и рекурсивный обход всех входящих деталей (.m3d),
-    включая вложенные подсборки, с дедупликацией и пропуском стандартных изделий;
+    включая вложенные подсборки, исполнения и локальные детали (встроенные
+    в сборку), с дедупликацией и пропуском стандартных изделий;
   * определение листовых деталей через API листового моделирования
     (ISheetMetalBody) и автоматическое построение развертки (Straighten);
   * пауза на каждой детали: пользователь проверяет развертку / поворачивает
@@ -13,7 +14,13 @@ DXFka — пакетный экспорт DXF из деталей сборки �
     «Продолжить» в окне программы;
   * создание чертежа-фрагмента 1:1 БЕЗ рамки и штампа и экспорт в DXF
     (ksSaveToDXF) — только геометрия, единицы мм;
-  * подробный журнал (kompas_dxf_exporter.log) и сводка по результатам;
+  * на первой паузе каждой детали определяется вид для резки и вводится
+    толщина; готовые DXF раскладываются по подпапкам с именем толщины
+    внутри папки DXF;
+  * подробный журнал (kompas_dxf_exporter.log); в GUI журнал открывается
+    по запросу — меню «Файл → Показать журнал»;
+  * подробный журнал (kompas_dxf_exporter.log); в GUI открывается
+    по запросу — меню «Файл → Показать журнал»; сводка по результатам;
   * коммерциализация: пробная версия с лимитом экспортов, оффлайн-лицензия
     (файл license.key), привязанная к компьютеру (HWID).
 
@@ -55,7 +62,7 @@ import tempfile
 import traceback
 import threading
 import winreg
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, List, Tuple, Callable, Dict, Any
 
 import tkinter as tk
@@ -153,12 +160,14 @@ DEFAULT_OUT_SUBDIR = "DXF_Out"
 STARTUP_INSTRUCTIONS = (
     "Порядок работы:\n"
     "  1. Укажите файл сборки (.a3d) и папку для DXF.\n"
-    "  2. Нажмите «Загрузить детали» — программа проанализирует сборку. "
-    "Если детали не найдены — добавьте их кнопкой «Добавить файлы вручную».\n"
+    "  2. Нажмите «Загрузить детали» — программа проанализирует сборку:\n"
+    "     будут найдены все детали, включая исполнения и локальные (встроенные\n"
+    "     в сборку, без своего файла). Не хватает — «Добавить файлы вручную».\n"
     "  3. Отметьте нужные детали и нажмите «Начать экспорт».\n"
-    "  4. Для КАЖДОЙ детали программа остановится: листовая — проверьте "
-    "развертку; нелистовая — поверните модель (видно в КОМПАС), при желании "
-    "сохраните вид с именем «DXF_Export». Затем нажмите «Продолжить».\n"
+    "  4. На ПЕРВОЙ паузе каждой детали: определите нужный вид для резки\n"
+    "     (листовая — проверьте развертку; нелистовая — поверните модель,\n"
+    "     при желании сохраните вид «DXF_Export»), затем укажите ТОЛЩИНУ\n"
+    "     (мм) — DXF сохранится в подпапку с этим номером (создаётся сама).\n"
     "  5. Результат: DXF 1:1 в мм, только геометрия (фрагмент без рамки).\n"
     f"  Поддержка и лицензии: {VENDOR} — {SUPPORT_EMAIL}"
 )
@@ -637,6 +646,10 @@ class PartInfo:
     is_sheet: Optional[bool] = None   # None — неизвестно (уточнится при экспорте)
     status: str = "PENDING"       # PENDING | OK | ERROR | SKIP
     message: str = ""
+    performance: str = ""         # номер исполнения ("" — исполнений нет)
+    is_local: bool = False        # True — локальная деталь (встроена в сборку)
+    local_seq: int = 0            # порядковый номер локальной детали при обходе
+    source_assembly: str = ""     # файл сборки-источника (для локальных деталей)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -647,6 +660,10 @@ class PartInfo:
             "is_sheet": self.is_sheet,
             "status": self.status,
             "message": self.message,
+            "performance": self.performance,
+            "is_local": self.is_local,
+            "local_seq": self.local_seq,
+            "source_assembly": self.source_assembly,
         }
 
     @classmethod
@@ -657,14 +674,39 @@ class PartInfo:
             marking=data.get("marking", ""),
             material=data.get("material", ""),
             is_sheet=data.get("is_sheet"),
+            performance=data.get("performance", ""),
+            is_local=bool(data.get("is_local", False)),
+            local_seq=int(data.get("local_seq", 0)),
+            source_assembly=data.get("source_assembly", ""),
         )
+
+    @property
+    def uid(self) -> str:
+        """
+        Уникальный ключ строки в GUI и сообщениях PART_UPDATE:
+        путь файла + исполнение; для локальных деталей — синтетический.
+        """
+        if self.is_local:
+            return (f"local|{self.marking}|{self.name}|"
+                    f"{self.performance}|{self.local_seq}")
+        return (os.path.normcase(os.path.abspath(self.file_path))
+                + "|" + self.performance)
 
 
 def build_dxf_basename(part: PartInfo) -> str:
-    """Базовое имя DXF: «обозначение наименование», иначе имя исходного файла."""
+    """
+    Базовое имя DXF: «обозначение наименование», иначе имя исходного файла.
+    Для исполнения добавляется суффикс «-NN», чтобы файлы вариантов
+    одной детали не перезаписывали друг друга.
+    """
     base = f"{part.marking} {part.name}".strip()
     if not base:
-        base = os.path.splitext(os.path.basename(part.file_path))[0]
+        if part.is_local:
+            base = "Локальная деталь"
+        else:
+            base = os.path.splitext(os.path.basename(part.file_path))[0]
+    if part.performance:
+        base = f"{base} -{part.performance}"
     return sanitize_filename(base) or "part"
 
 
@@ -673,6 +715,18 @@ def part_type_text(is_sheet: Optional[bool]) -> str:
     if is_sheet is None:
         return "?"
     return "листовая" if is_sheet else "нелистовая"
+
+
+def part_file_label(part: PartInfo) -> str:
+    """Текст колонки «Файл»: имя файла либо пометка локальной детали."""
+    if part.is_local:
+        return "(локальная)"
+    return os.path.basename(part.file_path)
+
+
+# Колонки списка деталей (заголовок и строки — единый порядок ширин).
+LIST_COLUMNS = [("", 4), ("Файл", 40), ("Тип", 13),
+                ("Обозначение", 18), ("Наименование", 24), ("Статус", 24)]
 
 
 # ======================================================================
@@ -689,6 +743,58 @@ class CancelledByUser(Exception):
 
 class SkippedByUser(Exception):
     """Пользователь нажал «Пропустить деталь» на паузе."""
+
+
+# ======================================================================
+# СБРОС КЕША COM-ОБОЁРТОК PYWIN32 (win32com.gen_py)
+# ======================================================================
+
+def clear_com_cache() -> List[str]:
+    """
+    Удалить кеш COM-обёрток pywin32: каталог win32com.gen_py на диске
+    (site-packages\\win32com\\gen_py и/или %TEMP%\\gen_py) и загруженные
+    модули из памяти процесса.
+
+    Лечит ошибки вида «module 'win32com.gen_py.…' has no attribute
+    'IAssemblyDocument' / 'IKompasDocument3D'», которые возникают при
+    устаревшем кеше после обновления/переустановки КОМПАС-3D. Кеш
+    пересоздаётся автоматически при следующем подключении к КОМПАС.
+
+    Вызывать только когда экспорт не выполняется. Возвращает список
+    удалённых каталогов.
+    """
+    dirs = set()
+    try:
+        import win32com
+        gen_path = getattr(win32com, "__gen_path__", None)
+        if gen_path and os.path.isdir(gen_path):
+            dirs.add(os.path.normpath(gen_path))
+    except Exception:
+        pass
+    tmp_gen = os.path.normpath(os.path.join(tempfile.gettempdir(), "gen_py"))
+    if os.path.isdir(tmp_gen):
+        dirs.add(tmp_gen)
+
+    removed: List[str] = []
+    for path in dirs:
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.isdir(path):
+            removed.append(path)
+
+    for name in [n for n in list(sys.modules)
+                 if n == "win32com.gen_py"
+                 or n.startswith("win32com.gen_py.")]:
+        del sys.modules[name]
+
+    try:
+        for attr in ("loadedInfo", "loaded_info"):
+            state = getattr(gencache, attr, None)
+            if isinstance(state, dict):
+                state.clear()
+    except Exception:
+        pass
+
+    return removed
 
 
 # ======================================================================
@@ -839,6 +945,8 @@ class AssemblyWalker:
         self.conn = conn
         self.log = log
         self.cancel_event = cancel_event
+        self._local_seq = 0           # счётчик локальных деталей (для uid)
+        self.source_assembly = ""     # файл сборки-источника (для PartInfo)
 
     # ------------------------------------------------------------------
 
@@ -849,9 +957,25 @@ class AssemblyWalker:
         """Точка входа: возвращает список уникальных деталей сборки."""
         parts: List[PartInfo] = []
         seen = set()
+        self._local_seq = 0
+        self.source_assembly = os.path.abspath(assembly_path)
         self._walk_file(assembly_path, parts, seen, depth=0)
         self.log("info", f"Обход завершён. Найдено уникальных деталей: {len(parts)}")
         return parts
+
+    def walk_top(self, top_part: Any, base_dir: str,
+                 source_assembly: str) -> List[Tuple[PartInfo, Any]]:
+        """
+        Обход уже открытого TopPart (используется экспортёром локальных
+        деталей). Возвращает пары (PartInfo, компонент IPart7) в том же
+        порядке, что и при анализе сборки, — порядок детерминирован.
+        """
+        pairs: List[Tuple[PartInfo, Any]] = []
+        self._local_seq = 0
+        self.source_assembly = source_assembly
+        self._walk_parts_inmemory(top_part, pairs, set(), set(), 1, base_dir)
+        self.log("info", f"Повторный обход TopPart: найдено деталей {len(pairs)}")
+        return pairs
 
     # ------------------------------------------------------------------
 
@@ -891,17 +1015,74 @@ class AssemblyWalker:
                 self.log("warning", f"IKompasDocument3D: {exc}; динамический fallback")
         return doc
 
+    def get_top_part(self, doc: Any) -> Any:
+        """
+        TopPart сборки: IAssemblyDocument(doc).TopPart, fallback —
+        IKompasDocument3D(doc).TopPart. None — получить не удалось.
+        Общий код для обхода файла и выгрузки локальных деталей.
+        """
+        asm = None
+        if self.conn.api7_module is not None:
+            try:
+                asm = self.conn.api7_module.IAssemblyDocument(doc)
+            except Exception as exc:
+                self.log("warning", f"IAssemblyDocument: {exc}")
+        top_part = None
+        if asm is not None:
+            try:
+                top_part = asm.TopPart
+            except Exception as exc:
+                self.log("warning", f"asm.TopPart: {exc}")
+        if top_part is None:
+            try:
+                top_part = self._get_doc3d(doc).TopPart
+            except Exception as exc:
+                self.log("warning", f"doc3d.TopPart: {exc}")
+        return top_part
+
     # ------------------------------------------------------------------
 
-    def _walk_parts_inmemory(self, part: Any, parts: List[PartInfo],
+    def _component_children(self, part: Any) -> List[Any]:
+        """
+        Компоненты узла: перебор стратегий доступа (Parts -> PartsEx ->
+        Components); какая сработала — в лог (на v24 PartsEx бывал пуст).
+        """
+        getters = (
+            ("Parts", lambda: part.Parts),
+            ("PartsEx()", lambda: part.PartsEx()),
+            ("PartsEx(1)", lambda: part.PartsEx(1)),
+            ("Components", lambda: part.Components),
+        )
+        for label, getter in getters:
+            try:
+                collection = getter()
+            except Exception as exc:
+                if label == "Parts":
+                    self.log("warning", f"part.Parts: {exc}")
+                continue
+            items = com_items(collection)
+            if items:
+                if label != "Parts":
+                    self.log("info",
+                             f"Компоненты получены через {label}: "
+                             f"{len(items)} шт.")
+                return items
+        return []
+
+    def _walk_parts_inmemory(self, part: Any,
+                             pairs: List[Tuple[PartInfo, Any]],
                              refs: set, seen_paths: set,
                              depth: int, base_dir: str) -> None:
         """
         Рекурсивный обход компонентов сборки В ПАМЯТИ (проверено на v24,
         по образцу «Сводника»): part.Parts -> CastTo(IPart7) -> рекурсия
-        по p7.Parts; подсборки с диска не открываются. Дедупликация:
+        по p7.Parts; подсборки с диска не открываются. В pairs попадают
+        пары (PartInfo, компонент) — компонент нужен экспортёру локальных
+        деталей. Дедупликация:
           refs       — по Reference компонента (защита от циклов дерева);
-          seen_paths — по пути файла детали (один файл = один экспорт).
+          seen_paths — по (путь файла, исполнение): разные исполнения
+                       одного файла = отдельные записи;
+          локальные детали (без своего файла) — по своему ключу.
         Путь файла: у IPart7 нет FilePath; свойства — PathName (обычно
         полный путь), FileName (имя файла), Path (каталог). Относительное
         имя достраиваем от Path либо от каталога сборки.
@@ -913,75 +1094,162 @@ class AssemblyWalker:
         if depth > MAX_ASSEMBLY_DEPTH:
             self.log("warning", "Превышена глубина вложенности компонентов")
             return
-        try:
-            collection = part.Parts
-        except Exception as exc:
-            self.log("warning", f"part.Parts: {exc}")
-            return
-        children = com_items(collection)
+        children = self._component_children(part)
         if not children:
             return
 
         for child in children:
             if self._cancelled():
                 return
-            try:
-                p7 = CastTo(child, "IPart7")
-            except Exception:
-                p7 = child
+            self._process_component(child, pairs, refs, seen_paths,
+                                    depth, base_dir)
 
-            name = safe_str(p7, "Name") or "Без имени"
-            ref = safe_str(p7, "Reference")
-            if not ref:
-                ref = f"{safe_str(p7, 'Marking')}|{name}|{depth}"
-            if ref in refs:
-                continue
-            refs.add(ref)
+    def _process_component(self, child: Any,
+                           pairs: List[Tuple[PartInfo, Any]],
+                           refs: set, seen_paths: set,
+                           depth: int, base_dir: str) -> None:
+        """Обработка одного компонента сборки (файлового или локального)."""
+        try:
+            p7 = CastTo(child, "IPart7")
+        except Exception:
+            p7 = child
 
-            path_name = safe_str(p7, "PathName")
-            file_only = safe_str(p7, "FileName")
-            dir_path = safe_str(p7, "Path")
-            file_name = ""
-            for cand in (path_name, file_only):
-                if cand and os.path.splitext(cand)[1].lower() in (".a3d",
-                                                                 ".m3d"):
-                    file_name = cand
-                    break
-            if not file_name:
-                file_name = path_name or file_only
-            if not file_name:
-                self.log("warning", f"Компонент без пути — пропущен: {name}")
-                continue
-            if not os.path.isabs(file_name):
-                file_name = os.path.join(dir_path or base_dir, file_name)
-            child_ext = os.path.splitext(file_name)[1].lower()
-            self.log("info", f"Компонент: {name} -> {file_name}")
+        name = safe_str(p7, "Name") or "Без имени"
+        ref = safe_str(p7, "Reference")
+        if not ref:
+            ref = f"{safe_str(p7, 'Marking')}|{name}|{depth}"
+        if ref in refs:
+            return
+        refs.add(ref)
 
-            if child_ext == ".a3d":
-                # Подсборка — рекурсия в памяти, без открытия с диска.
-                self._walk_parts_inmemory(p7, parts, refs, seen_paths,
-                                          depth + 1, base_dir)
-            elif child_ext == ".m3d":
-                key = os.path.normcase(os.path.abspath(file_name))
-                if key in seen_paths:
-                    continue
-                seen_paths.add(key)
-                if is_standard_part_path(file_name):
-                    self.log("info",
-                             f"Пропущено стандартное изделие: "
-                             f"{os.path.basename(file_name)}")
-                    continue
-                material = safe_str(p7, "Material")
-                parts.append(PartInfo(
-                    file_path=os.path.abspath(file_name),
-                    name=name,
-                    marking=safe_str(p7, "Marking"),
-                    material=material,
-                    is_sheet=self._sheet_heuristic(material),
-                ))
-            else:
-                self.log("warning",
-                         f"Компонент неизвестного типа пропущен: {file_name}")
+        marking = safe_str(p7, "Marking")
+        path_name = safe_str(p7, "PathName")
+        file_only = safe_str(p7, "FileName")
+        dir_path = safe_str(p7, "Path")
+        file_name = ""
+        for cand in (path_name, file_only):
+            if cand and os.path.splitext(cand)[1].lower() in (".a3d",
+                                                              ".m3d"):
+                file_name = cand
+                break
+        if not file_name:
+            file_name = path_name or file_only
+        if not file_name:
+            self._process_local_component(p7, name, marking, pairs,
+                                          seen_paths, depth, base_dir)
+            return
+        if not os.path.isabs(file_name):
+            file_name = os.path.join(dir_path or base_dir, file_name)
+        child_ext = os.path.splitext(file_name)[1].lower()
+        self.log("info", f"Компонент: {name} -> {file_name}")
+
+        if child_ext == ".a3d":
+            # Подсборка — рекурсия в памяти, без открытия с диска.
+            self._walk_parts_inmemory(p7, pairs, refs, seen_paths,
+                                      depth + 1, base_dir)
+        elif child_ext == ".m3d":
+            performance = self._component_performance(p7, name, marking)
+            key = (os.path.normcase(os.path.abspath(file_name)), performance)
+            if key in seen_paths:
+                return
+            seen_paths.add(key)
+            if is_standard_part_path(file_name):
+                self.log("info",
+                         f"Пропущено стандартное изделие: "
+                         f"{os.path.basename(file_name)}")
+                return
+            material = safe_str(p7, "Material")
+            pairs.append((PartInfo(
+                file_path=os.path.abspath(file_name),
+                name=name,
+                marking=marking,
+                material=material,
+                is_sheet=self._sheet_heuristic(material),
+                performance=performance,
+                source_assembly=self.source_assembly,
+            ), p7))
+        else:
+            self.log("warning",
+                     f"Компонент неизвестного типа пропущен: {file_name}")
+
+    def _process_local_component(self, p7: Any, name: str, marking: str,
+                                 pairs: List[Tuple[PartInfo, Any]],
+                                 seen_paths: set,
+                                 depth: int, base_dir: str) -> None:
+        """
+        Локальный компонент (встроен в сборку, своего файла нет):
+        подсборка — рекурсия; деталь — запись с is_local=True (экспорт
+        выполняется выгрузкой во временный .m3d, см. PartExporter).
+        """
+        if self._is_local_subassembly(p7, name):
+            self.log("info", f"Локальная подсборка — рекурсия: {name}")
+            self._walk_parts_inmemory(p7, pairs, refs, seen_paths,
+                                      depth + 1, base_dir)
+            return
+        performance = self._component_performance(p7, name, marking)
+        key = (f"local|{marking}|{name}", performance)
+        if key in seen_paths:
+            return
+        seen_paths.add(key)
+        self._local_seq += 1
+        material = safe_str(p7, "Material")
+        self.log("info", f"Локальная деталь: {name} (#{self._local_seq})")
+        pairs.append((PartInfo(
+            file_path="",
+            name=name,
+            marking=marking,
+            material=material,
+            is_sheet=self._sheet_heuristic(material),
+            performance=performance,
+            is_local=True,
+            local_seq=self._local_seq,
+            source_assembly=self.source_assembly,
+        ), p7))
+
+    def _is_local_subassembly(self, part: Any, name: str) -> bool:
+        """
+        Локальный компонент — подсборка? Перебираем признаки, всё в
+        try/except (TODO_KOMPAS: точное свойство API не подтверждено).
+        """
+        for attr in ("IsAssembly", "AssemblyContent"):
+            value = safe_str(part, attr).strip().lower()
+            if value and value not in ("0", "false", "no"):
+                self.log("info",
+                         f"«{name}»: {attr}={value} — считаю подсборкой")
+                return True
+            if value:
+                return False
+        try:
+            if com_count(part.Parts):
+                self.log("info",
+                         f"«{name}»: есть вложенные компоненты — "
+                         "считаю локальной подсборкой")
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _component_performance(self, p7: Any, name: str, marking: str) -> str:
+        """
+        Номер исполнения компонента: свойство API (перебор кандидатов)
+        либо суффикс «-NN» в обозначении (конструкция по ЕСКД).
+        TODO_KOMPAS: имя свойства исполнений в API7 не подтверждено —
+        при первой проверке смотреть строки лога «Исполнение компонента».
+        """
+        for attr in ("Performance", "PerformanceNumber", "ExecutionNumber"):
+            value = safe_str(p7, attr).strip()
+            if value:
+                self.log("info",
+                         f"Исполнение компонента «{name}»: {value} "
+                         f"(свойство {attr})")
+                return value
+        match = re.search(r"-(\d{2,3})\s*$", (marking or "").strip())
+        if match:
+            self.log("info",
+                     f"Исполнение компонента «{name}»: {match.group(1)} "
+                     "(по суффиксу обозначения)")
+            return match.group(1)
+        return ""
 
     def _sheet_heuristic(self, material: str) -> Optional[bool]:
         """
@@ -1025,31 +1293,17 @@ class AssemblyWalker:
                 return
 
             # Сборка: IAssemblyDocument -> TopPart -> компоненты.
-            asm = None
-            if self.conn.api7_module is not None:
-                try:
-                    asm = self.conn.api7_module.IAssemblyDocument(doc)
-                except Exception as exc:
-                    self.log("warning", f"IAssemblyDocument: {exc}")
-            top_part = None
-            if asm is not None:
-                try:
-                    top_part = asm.TopPart
-                except Exception as exc:
-                    self.log("warning", f"asm.TopPart: {exc}")
-            if top_part is None:
-                try:
-                    top_part = self._get_doc3d(doc).TopPart
-                except Exception as exc:
-                    self.log("warning", f"doc3d.TopPart: {exc}")
+            top_part = self.get_top_part(doc)
             if top_part is None:
                 self.log("error", "Не удалось получить TopPart сборки")
                 return
 
             base_dir = os.path.dirname(os.path.abspath(path))
             self.log("info", "Обход компонентов в памяти (IPart7.Parts)")
-            self._walk_parts_inmemory(top_part, parts, set(), seen, 1,
+            pairs: List[Tuple[PartInfo, Any]] = []
+            self._walk_parts_inmemory(top_part, pairs, set(), seen, 1,
                                       base_dir)
+            parts.extend(info for info, _ in pairs)
         finally:
             self._close_document(doc)
 
@@ -1372,25 +1626,115 @@ class PartExporter:
                 time.sleep(0.3)
 
     # ------------------------------------------------------------------
+    # Локальные детали: выгрузка из сборки во временные .m3d
+    # ------------------------------------------------------------------
+
+    def export_local_parts(self, assembly_path: str,
+                           local_parts: List[PartInfo]) -> Dict[str, str]:
+        """
+        Выгрузить выбранные локальные детали (is_local=True) из сборки
+        во временные файлы .m3d. Возвращает {uid: temp_path} для успешно
+        выгруженных; неудачи логируются (в списке их обработает цикл
+        экспорта как ERROR). Сборка открывается один раз на группу.
+        """
+        resolved: Dict[str, str] = {}
+        if not local_parts:
+            return resolved
+        doc, opened_by_us = self._open_or_reuse(assembly_path)
+        if doc is None:
+            self.log("error",
+                     f"Не удалось открыть сборку для локальных деталей: "
+                     f"{assembly_path}")
+            return resolved
+        try:
+            walker = AssemblyWalker(self.conn, self.log)
+            top = walker.get_top_part(doc)
+            if top is None:
+                self.log("error", "Не удалось получить TopPart сборки "
+                                  "(локальные детали)")
+                return resolved
+            base_dir = os.path.dirname(os.path.abspath(assembly_path))
+            pairs = walker.walk_top(top, base_dir,
+                                    os.path.abspath(assembly_path))
+            by_uid = {info.uid: obj for info, obj in pairs}
+            for part in local_parts:
+                obj = by_uid.get(part.uid)
+                if obj is None:
+                    self.log("error",
+                             f"Локальная деталь не найдена при повторном "
+                             f"обходе (порядок изменился?): {part.name}")
+                    continue
+                temp_m3d = os.path.join(
+                    self.tmp_dir,
+                    f"local_{part.local_seq:03d}_"
+                    + sanitize_filename(part.name or "деталь") + ".m3d")
+                if self._save_local_to_m3d(obj, temp_m3d):
+                    resolved[part.uid] = temp_m3d
+                    self.log("info",
+                             f"Локальная деталь выгружена: {part.name} -> "
+                             f"{os.path.basename(temp_m3d)}")
+        finally:
+            self._close_doc(doc, opened_by_us)
+        return resolved
+
+    def _save_local_to_m3d(self, obj: Any, temp_path: str) -> bool:
+        """
+        Сохранить локальную деталь (объект IPart7 из открытой сборки)
+        отдельным файлом .m3d. Метод сохранения компонента перебираем
+        кандидатами — точный API не подтверждён (TODO_KOMPAS: при первой
+        проверке смотреть строки лога ниже).
+        """
+        if os.path.isfile(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        candidates = (
+            ("SaveAs", lambda: obj.SaveAs(temp_path)),
+            ("SaveComponentAs", lambda: obj.SaveComponentAs(temp_path)),
+            ("SaveToFile", lambda: obj.SaveToFile(temp_path)),
+        )
+        for label, call in candidates:
+            try:
+                call()
+            except Exception as exc:
+                self.log("warning",
+                         f"Сохранение локальной детали ({label}): {exc}")
+                continue
+            time.sleep(0.5)
+            if os.path.isfile(temp_path) and os.path.getsize(temp_path) > 0:
+                return True
+            self.log("warning",
+                     f"{label} отработал без исключения, файл не создан")
+        return False
+
+    # ------------------------------------------------------------------
     # Главный метод: экспорт одной детали
     # ------------------------------------------------------------------
 
-    def export_part(self, part: PartInfo, dxf_path: str,
-                    pause: Callable[[str, str], None]) -> Tuple[str, str]:
-        """
-        Обработка одной детали. pause(title, instruction) — блокирующий
-        вызов, бросает CancelledByUser/SkippedByUser.
-        Возвращает ("OK" | "ERROR", сообщение).
-        """
-        self.log("info", "=" * 70)
-        self.log("info", f"Деталь: {os.path.basename(part.file_path)}")
-
-        # Убираем возможный старый DXF от прошлого запуска.
+    def _fresh_dxf_path(self, dxf_path_factory: Callable[[], str]) -> str:
+        """Путь DXF от фабрики рабочего потока + удаление старого файла."""
+        dxf_path = dxf_path_factory()
         if os.path.isfile(dxf_path):
             try:
                 os.remove(dxf_path)
             except OSError as exc:
-                return "ERROR", f"Не удалось удалить старый DXF ({exc})"
+                self.log("warning",
+                         f"Не удалось удалить старый DXF: {exc}")
+        return dxf_path
+
+    def export_part(self, part: PartInfo,
+                    dxf_path_factory: Callable[[], str],
+                    pause: Callable[[str, str], None]) -> Tuple[str, str]:
+        """
+        Обработка одной детали. pause(title, instruction) — блокирующий
+        вызов, бросает CancelledByUser/SkippedByUser. dxf_path_factory()
+        вызывается непосредственно перед сохранением: путь (подпапка
+        толщины) становится известен после первой паузы детали.
+        Возвращает ("OK" | "ERROR", сообщение).
+        """
+        self.log("info", "=" * 70)
+        self.log("info", f"Деталь: {os.path.basename(part.file_path)}")
 
         state = {"ok": False}                 # для finally-уборки
         doc = None
@@ -1468,6 +1812,7 @@ class PartExporter:
 
                 # Фрагмент из временной (развёрнутой) модели, текущая
                 # ориентация (пустая projectionName) — проверено test_unfold_v2.
+                dxf_path = self._fresh_dxf_path(dxf_path_factory)
                 _, ok, message = self._build_fragment_view(temp_m3d, "",
                                                            dxf_path, pause)
                 if not ok:
@@ -1507,6 +1852,7 @@ class PartExporter:
             self._close_doc(doc, opened_by_us)
             doc = None
 
+            dxf_path = self._fresh_dxf_path(dxf_path_factory)
             _, ok, message = self._build_fragment_view(temp_m3d, "", dxf_path)
             if not ok:
                 self.log("warning",
@@ -1559,7 +1905,7 @@ class ExportWorker(threading.Thread):
                  cancel_event: threading.Event,
                  skip_event: threading.Event,
                  mode: str,                       # "traverse" | "export"
-                 payload: Any,                    # путь сборки | [(PartInfo, dxf)]
+                 payload: Any,                    # путь сборки | (папка DXF, [PartInfo])
                  lic: LicenseManager,
                  logger: logging.Logger):
         super().__init__(daemon=True)
@@ -1572,6 +1918,10 @@ class ExportWorker(threading.Thread):
         self.lic = lic
         self.logger = logger
         self.template_path: Optional[str] = None   # шаблон фрагмента (.frw)
+        # Диалог толщины: GUI кладёт результат и будит событие.
+        self.thickness_event = threading.Event()
+        self.thickness_result: Optional[Tuple[str, str]] = None
+        self._last_thickness = ""                  # подставляется по умолчанию
 
     # ---------------------- сообщения GUI ----------------------
 
@@ -1598,6 +1948,51 @@ class ExportWorker(threading.Thread):
                 raise CancelledByUser()
         if self.skip_event.is_set():
             raise SkippedByUser()
+
+    def _ask_thickness(self, part: PartInfo) -> Tuple[str, str]:
+        """
+        Запрос толщины детали у пользователя (диалог в GUI-потоке).
+        Возвращает ("ok", толщина_мм) | ("skip", "") | ("cancel", "").
+        GUI кладёт результат в self.thickness_result и будит
+        self.thickness_event; «Остановить» в GUI также будит cancel_event.
+        """
+        self.thickness_result = None
+        self.thickness_event.clear()
+        self._status("Укажите толщину детали…")
+        self.msg_queue.put({"type": "ASK_THICKNESS",
+                            "part": part.name
+                            or os.path.basename(part.file_path),
+                            "default": self._last_thickness})
+        while not self.thickness_event.wait(0.2):
+            if self.cancel_event.is_set():
+                return "cancel", ""
+        result = self.thickness_result or ("cancel", "")
+        if result[0] == "ok":
+            self._last_thickness = result[1]
+        return result
+
+    def _unique_dxf_name(self, part: PartInfo, part_dir: str,
+                         used_names: Dict[str, set]) -> str:
+        """Уникальное имя DXF внутри папки толщины: «база», «база (2)», …"""
+        taken = used_names.setdefault(os.path.normcase(part_dir), set())
+        base = build_dxf_basename(part)
+        name = base
+        suffix = 2
+        while name.lower() in taken:
+            name = f"{base} ({suffix})"
+            suffix += 1
+        taken.add(name.lower())
+        return name
+
+    def _make_dxf_path(self, part: PartInfo, out_dir: str, thickness: str,
+                       used_names: Dict[str, set]) -> str:
+        r"""Папка «<DXF>\<толщина>» (создаётся) + уникальное имя -> путь DXF."""
+        part_dir = os.path.join(out_dir, sanitize_filename(thickness))
+        os.makedirs(part_dir, exist_ok=True)
+        name = self._unique_dxf_name(part, part_dir, used_names)
+        path = os.path.join(part_dir, name + ".dxf")
+        self._log("info", f"Толщина {thickness} мм -> папка: {part_dir}")
+        return path
 
     # ---------------------- главный цикл ----------------------
 
@@ -1630,20 +2025,42 @@ class ExportWorker(threading.Thread):
                 return
 
             # ---------- экспорт выбранных деталей ----------
-            jobs: List[Tuple[PartInfo, str]] = list(self.payload)
+            out_dir, selected_parts = self.payload
+            parts_list: List[PartInfo] = list(selected_parts)
             tmp_dir = tempfile.mkdtemp(prefix="kompas_dxf_")
             self._log("info", f"Временный каталог: {tmp_dir}")
             exporter = PartExporter(conn, self._log, tmp_dir,
                                     self.template_path)
 
-            total = len(jobs)
+            # Локальные детали: предварительная выгрузка из сборок в temp
+            # (сборка открывается один раз на группу, затем обычный конвейер).
+            local_by_asm: Dict[str, List[PartInfo]] = {}
+            for part in parts_list:
+                if part.is_local:
+                    local_by_asm.setdefault(
+                        part.source_assembly or "", []).append(part)
+            local_resolved: Dict[str, str] = {}
+            for asm_path, locals_ in local_by_asm.items():
+                if not asm_path:
+                    for part in locals_:
+                        self._log("error",
+                                  f"Локальная деталь без сборки-источника: "
+                                  f"{part.name}")
+                    continue
+                self._status("Выгрузка локальных деталей из сборки "
+                             f"({len(locals_)} шт.)…")
+                local_resolved.update(
+                    exporter.export_local_parts(asm_path, locals_))
+
+            total = len(parts_list)
             ok = err = skip = 0
             cancelled = False
             stopped_by_limit = False
             had_errors = False
+            used_names: Dict[str, set] = {}   # папка толщины -> занятые имена
             self.msg_queue.put({"type": "PROGRESS", "done": 0, "total": total})
 
-            for index, (part, dxf_path) in enumerate(jobs, start=1):
+            for index, part in enumerate(parts_list, start=1):
                 if self.cancel_event.is_set():
                     cancelled = True
                     break
@@ -1658,9 +2075,51 @@ class ExportWorker(threading.Thread):
                     stopped_by_limit = True
                     break
 
+                # Путь DXF известен только после первой паузы детали
+                # (толщина задаёт подпапку), поэтому передаём «фабрику» пути,
+                # а толщина запрашивается сразу после первой паузы.
+                box: Dict[str, str] = {"path": ""}
+                first_pause: Dict[str, bool] = {"done": False}
+
+                def dxf_factory() -> str:
+                    if not box["path"]:
+                        raise RuntimeError(
+                            "Толщина не задана — путь DXF не определён")
+                    return box["path"]
+
+                def part_pause(title: str, instruction: str) -> None:
+                    """Первая пауза детали: вид для резки + запрос толщины."""
+                    if not first_pause["done"]:
+                        first_pause["done"] = True
+                        instruction = (
+                            "Определите нужный вид для резки, а также "
+                            "толщину детали —\nона задаёт подпапку, в которую "
+                            "будет сохранён DXF.\n\n" + instruction)
+                    self._pause(title, instruction)
+                    if not box["path"]:
+                        action, thickness = self._ask_thickness(part)
+                        if action == "skip":
+                            raise SkippedByUser()
+                        if action == "cancel":
+                            raise CancelledByUser()
+                        box["path"] = self._make_dxf_path(
+                            part, out_dir, thickness, used_names)
+
                 status, message = "ERROR", ""
                 try:
-                    status, message = exporter.export_part(part, dxf_path, self._pause)
+                    if part.is_local and part.uid not in local_resolved:
+                        status, message = "ERROR", (
+                            "Не удалось выгрузить локальную деталь "
+                            "из сборки (подробности в журнале)")
+                    elif part.is_local:
+                        # Локальная деталь экспортируется из временного .m3d.
+                        status, message = exporter.export_part(
+                            replace(part,
+                                    file_path=local_resolved[part.uid]),
+                            dxf_factory, part_pause)
+                    else:
+                        status, message = exporter.export_part(
+                            part, dxf_factory, part_pause)
                     if status == "OK":
                         self.lic.commit()      # успешный экспорт: счётчик +1
                     else:
@@ -1692,7 +2151,7 @@ class ExportWorker(threading.Thread):
                     self._log("error", f"Результат: ERROR — {message}")
 
                 self.msg_queue.put({"type": "PART_UPDATE",
-                                    "file_path": part.file_path,
+                                    "uid": part.uid,
                                     "status": status,
                                     "message": message,
                                     "is_sheet": part.is_sheet})
@@ -1744,6 +2203,69 @@ class ExportWorker(threading.Thread):
 # ГРАФИЧЕСКИЙ ИНТЕРФЕЙС (tkinter)
 # ======================================================================
 
+class Tooltip:
+    """
+    Всплывающая подсказка для виджета: появляется с задержкой при
+    наведении, исчезает при уходе курсора/нажатии кнопки мыши.
+    """
+
+    def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 600):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._after_id: Optional[str] = None
+        self._tip: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
+
+    def _schedule(self, _event: Optional[tk.Event] = None) -> None:
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._tip is not None or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        try:
+            self._tip.attributes("-topmost", True)
+        except Exception:
+            pass
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self._tip, text=self.text, justify="left",
+                 background="#ffffe0", relief="solid", borderwidth=1,
+                 font=("Segoe UI", 9), wraplength=420,
+                 padx=6, pady=4).pack()
+
+    def _hide(self, _event: Optional[tk.Event] = None) -> None:
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+def add_tooltip(widget: tk.Widget, text: str) -> Tooltip:
+    """Подсказка + сохранение ссылки на виджете (защита от сборщика мусора)."""
+    tooltip = Tooltip(widget, text)
+    widget._tooltip = tooltip          # noqa: SLF001 — намеренное поле-владелец
+    return tooltip
+
+
 class App(tk.Tk):
     """Главное окно приложения."""
 
@@ -1753,8 +2275,8 @@ class App(tk.Tk):
         self.logger = logger
 
         self.title(f"{APP_TITLE} — {VENDOR}")
-        self.geometry("1020x780")
-        self.minsize(880, 660)
+        self.geometry("1020x720")
+        self.minsize(860, 600)
 
         # Мосты GUI <-> рабочий поток.
         self.msg_queue: "queue.Queue" = queue.Queue()
@@ -1763,11 +2285,18 @@ class App(tk.Tk):
         self.skip_event = threading.Event()
         self.worker: Optional[ExportWorker] = None
 
+        # Журнал: в главном окне не показываем — окно по запросу из меню.
+        self.log_text: Optional[tk.Text] = None
+        self._log_window: Optional[tk.Toplevel] = None
+        self._log_buffer: List[Tuple[str, str]] = []
+
         # Данные списка деталей.
         self.part_vars: List[Tuple[tk.BooleanVar, PartInfo]] = []
         self.rows: Dict[str, Dict[str, ttk.Label]] = {}   # normcase путь -> виджеты
 
+        self._apply_theme()
         self._build_ui()
+        self._build_menu()
         self._set_buttons("idle")
         self._update_license_label()
         self._log_gui("info", STARTUP_INSTRUCTIONS)
@@ -1775,13 +2304,99 @@ class App(tk.Tk):
         self.after(100, self._poll_queue)
 
     # ------------------------------------------------------------------
+    # Тема и меню
+    # ------------------------------------------------------------------
+
+    def _apply_theme(self) -> None:
+        """Современная системная тема и единые шрифты/отступы ttk."""
+        style = ttk.Style(self)
+        for theme in ("vista", "xpnative", "clam"):
+            if theme in style.theme_names():
+                style.theme_use(theme)
+                break
+        self.option_add("*Font", ("Segoe UI", 10))
+        style.configure("TButton", padding=(8, 4))
+        style.configure("TLabelframe.Label",
+                        font=("Segoe UI", 10, "bold"))
+        style.configure("Header.TLabel",
+                        font=("Segoe UI", 9, "bold"))
+
+    def _build_menu(self) -> None:
+        """Строка меню: Файл / Настройки / Справка (те же обработчики)."""
+        menubar = tk.Menu(self)
+
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="Выбрать сборку…",
+                           command=self.on_browse_assembly)
+        m_file.add_command(label="Добавить файлы деталей…",
+                           command=self.on_add_manual)
+        m_file.add_separator()
+        m_file.add_command(label="Показать журнал",
+                           command=self.show_log_window)
+        m_file.add_separator()
+        m_file.add_command(label="Выход", command=self.on_close)
+        menubar.add_cascade(label="Файл", menu=m_file)
+
+        m_settings = tk.Menu(menubar, tearoff=0)
+        m_settings.add_command(label="Папка DXF…",
+                               command=self.on_browse_out)
+        m_settings.add_command(label="Шаблон фрагмента…",
+                               command=self.on_browse_template)
+        m_settings.add_command(label="Сбросить шаблон",
+                               command=self.on_clear_template)
+        m_settings.add_separator()
+        m_settings.add_command(label="Сброс кеша COM…",
+                               command=self.on_clear_com_cache)
+        menubar.add_cascade(label="Настройки", menu=m_settings)
+
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="Инструкция",
+                           command=self.show_instructions)
+        m_help.add_command(label="Лицензия…",
+                           command=self.show_license_dialog)
+        m_help.add_command(label="О программе", command=self.show_about)
+        menubar.add_cascade(label="Справка", menu=m_help)
+
+        self.configure(menu=menubar)
+
+    # ------------------------------------------------------------------
     # Построение интерфейса
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # ---- Верх: пути ----
-        frm_top = ttk.Frame(self, padding=(8, 8, 8, 4))
-        frm_top.pack(fill="x")
+        # ---- Подвал: кнопки и лицензия, видны ВСЕГДА ----
+        # Пакуются первыми со стороны bottom: место под них резервируется
+        # у нижнего края, и длинный статус-текст не вытесняет кнопки
+        # за пределы окна (сжимается список деталей, а не подвал).
+        frm_bottom = ttk.Frame(self, padding=(8, 0, 8, 6))
+        frm_bottom.pack(side="bottom", fill="x")
+        self.license_var = tk.StringVar(value="")
+        self.license_label = ttk.Label(frm_bottom, textvariable=self.license_var)
+        self.license_label.pack(side="left")
+        self.license_label.bind("<Button-1>",
+                                lambda _e: self.show_license_dialog())
+        ttk.Label(frm_bottom,
+                  text=f"{VENDOR} — {SUPPORT_EMAIL}").pack(side="right")
+
+        frm_btn = ttk.Frame(self, padding=(8, 0, 8, 4))
+        frm_btn.pack(side="bottom", fill="x")
+        self.btn_export = ttk.Button(frm_btn, text="Начать экспорт",
+                                     command=self.on_start_export)
+        self.btn_export.pack(side="left")
+        self.btn_continue = ttk.Button(frm_btn, text="Продолжить",
+                                       command=self.on_continue)
+        self.btn_continue.pack(side="left", padx=(8, 0))
+        self.btn_skip = ttk.Button(frm_btn, text="Пропустить деталь",
+                                   command=self.on_skip)
+        self.btn_skip.pack(side="left", padx=(8, 0))
+        self.btn_cancel = ttk.Button(frm_btn, text="Остановить",
+                                     command=self.on_cancel)
+        self.btn_cancel.pack(side="right")
+
+        # ---- Верх: исходные данные ----
+        frm_top = ttk.LabelFrame(self, text="Исходные данные",
+                                 padding=(8, 6))
+        frm_top.pack(fill="x", padx=8, pady=(8, 4))
 
         self.asm_var = tk.StringVar()
         settings = load_settings()
@@ -1801,9 +2416,6 @@ class App(tk.Tk):
         self.btn_load = ttk.Button(
             frm_top, text="Загрузить детали", command=self.on_load_parts)
         self.btn_load.grid(row=0, column=3, padx=(0, 4))
-        self.btn_add = ttk.Button(
-            frm_top, text="Добавить файлы вручную", command=self.on_add_manual)
-        self.btn_add.grid(row=0, column=4)
 
         ttk.Label(frm_top, text="Папка для DXF:").grid(
             row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
@@ -1815,38 +2427,52 @@ class App(tk.Tk):
 
         ttk.Label(frm_top, text="Шаблон фрагмента:").grid(
             row=2, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
-        ttk.Entry(frm_top, textvariable=self.tpl_var).grid(
-            row=2, column=1, sticky="we", padx=(0, 4), pady=(6, 0))
+        self.tpl_entry = ttk.Entry(frm_top, textvariable=self.tpl_var)
+        self.tpl_entry.grid(row=2, column=1, sticky="we", padx=(0, 4),
+                            pady=(6, 0))
         self.btn_browse_tpl = ttk.Button(
             frm_top, text="Обзор…", command=self.on_browse_template)
         self.btn_browse_tpl.grid(row=2, column=2, pady=(6, 0))
         self.btn_clear_tpl = ttk.Button(
             frm_top, text="Сброс", command=self.on_clear_template)
         self.btn_clear_tpl.grid(row=2, column=3, pady=(6, 0))
-        ttk.Label(frm_top, foreground="#606060",
-                  text="необязательно: пустой фрагмент .frw —\n"
-                       "надписи не придётся удалять вручную").grid(
-                           row=2, column=4, sticky="w", pady=(6, 0))
 
         frm_top.columnconfigure(1, weight=1)
 
-        # ---- Середина: список деталей ----
+        # ---- Статус и прогресс (получает место раньше списка деталей,
+        # чтобы длинная инструкция не обрезалась) ----
+        frm_status = ttk.LabelFrame(self, text="Статус", padding=(8, 4))
+        frm_status.pack(fill="x", padx=8, pady=4)
+        self.status_var = tk.StringVar(value="Готов к работе")
+        ttk.Label(frm_status, textvariable=self.status_var,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.instr_var = tk.StringVar(value="")
+        ttk.Label(frm_status, textvariable=self.instr_var, justify="left",
+                  wraplength=940, foreground="#0a3d91").pack(anchor="w")
+        self.progress = ttk.Progressbar(frm_status, mode="determinate")
+        self.progress.pack(fill="x", pady=(4, 0))
+
+        # ---- Середина: список деталей (последним — забирает остаток
+        # места и сжимается/скроллится при нехватке высоты) ----
         frm_parts = ttk.LabelFrame(self, text="Детали", padding=(8, 4))
         frm_parts.pack(fill="both", expand=True, padx=8, pady=4)
 
         toolbar = ttk.Frame(frm_parts)
         toolbar.pack(fill="x", pady=(0, 4))
-        ttk.Button(toolbar, text="Выбрать все",
-                   command=lambda: self._toggle_all(True)).pack(side="left")
-        ttk.Button(toolbar, text="Снять все",
-                   command=lambda: self._toggle_all(False)).pack(
-                       side="left", padx=(6, 0))
+        self.btn_add = ttk.Button(toolbar, text="Добавить файлы",
+                                  command=self.on_add_manual)
+        self.btn_add.pack(side="left")
+        self.btn_select_all = ttk.Button(
+            toolbar, text="Выбрать все",
+            command=lambda: self._toggle_all(True))
+        self.btn_select_all.pack(side="left", padx=(8, 0))
+        self.btn_clear_all = ttk.Button(
+            toolbar, text="Снять все",
+            command=lambda: self._toggle_all(False))
+        self.btn_clear_all.pack(side="left", padx=(6, 0))
         self.counts_var = tk.StringVar(value="Найдено: 0    Выбрано: 0")
-        ttk.Label(toolbar, textvariable=self.counts_var).pack(
-            side="left", padx=16)
-        ttk.Label(toolbar, text="(«листовая» без звёздочки — тип подтверждён "
-                                "по API; до экспорта тип оценочный)").pack(
-                                    side="right")
+        self.counts_label = ttk.Label(toolbar, textvariable=self.counts_var)
+        self.counts_label.pack(side="left", padx=16)
 
         container = ttk.Frame(frm_parts)
         container.pack(fill="both", expand=True)
@@ -1880,66 +2506,42 @@ class App(tk.Tk):
             lambda e: self.canvas.unbind_all("<MouseWheel>"))
 
         # Заголовок колонок списка.
-        header = ttk.Frame(self.inner)
-        header.pack(fill="x", padx=2, pady=(0, 2))
-        columns = [("", 4), ("Файл", 40), ("Тип", 13),
-                   ("Обозначение", 18), ("Наименование", 24), ("Статус", 24)]
-        for text, width in columns:
-            ttk.Label(header, text=text, width=width, anchor="w",
-                      font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._make_list_header()
 
-        # ---- Статус и прогресс ----
-        frm_status = ttk.LabelFrame(self, text="Статус", padding=(8, 4))
-        frm_status.pack(fill="x", padx=8, pady=4)
-        self.status_var = tk.StringVar(value="Готов к работе")
-        ttk.Label(frm_status, textvariable=self.status_var,
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.instr_var = tk.StringVar(value="")
-        ttk.Label(frm_status, textvariable=self.instr_var, justify="left",
-                  wraplength=940, foreground="#0a3d91").pack(anchor="w")
-        self.progress = ttk.Progressbar(frm_status, mode="determinate")
-        self.progress.pack(fill="x", pady=(4, 0))
+        # ---- Журнал: открывается по запросу (меню «Файл → Показать журнал») --
+        # В главном окне журнала нет, чтобы все кнопки были видны сразу.
 
-        # ---- Журнал ----
-        frm_log = ttk.LabelFrame(self, text="Журнал", padding=(8, 4))
-        frm_log.pack(fill="both", padx=8, pady=(4, 4))
-        self.log_text = tk.Text(frm_log, height=9, state="disabled",
-                                wrap="none", font=("Consolas", 9))
-        log_scroll = ttk.Scrollbar(frm_log, orient="vertical",
-                                   command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        log_scroll.pack(side="right", fill="y")
-        self.log_text.pack(fill="both", expand=True)
-        for tag, color in (("info", "#202020"), ("warning", "#b36b00"),
-                           ("error", "#b00020"), ("ok", "#0a7a30")):
-            self.log_text.tag_configure(tag, foreground=color)
-
-        # ---- Кнопки управления ----
-        frm_btn = ttk.Frame(self, padding=(8, 0, 8, 4))
-        frm_btn.pack(fill="x")
-        self.btn_export = ttk.Button(frm_btn, text="Начать экспорт",
-                                     command=self.on_start_export)
-        self.btn_export.pack(side="left")
-        self.btn_continue = ttk.Button(frm_btn, text="Продолжить",
-                                       command=self.on_continue)
-        self.btn_continue.pack(side="left", padx=(8, 0))
-        self.btn_skip = ttk.Button(frm_btn, text="Пропустить деталь",
-                                   command=self.on_skip)
-        self.btn_skip.pack(side="left", padx=(8, 0))
-        self.btn_cancel = ttk.Button(frm_btn, text="Остановить",
-                                     command=self.on_cancel)
-        self.btn_cancel.pack(side="right")
-
-        # ---- Нижняя строка: лицензия ----
-        frm_bottom = ttk.Frame(self, padding=(8, 0, 8, 6))
-        frm_bottom.pack(fill="x")
-        ttk.Button(frm_bottom, text="Лицензия…",
-                   command=self.show_license_dialog).pack(side="left")
-        self.license_var = tk.StringVar(value="")
-        self.license_label = ttk.Label(frm_bottom, textvariable=self.license_var)
-        self.license_label.pack(side="left", padx=12)
-        ttk.Label(frm_bottom,
-                  text=f"{VENDOR} — {SUPPORT_EMAIL}").pack(side="right")
+        # ---- Всплывающие подсказки ----
+        for widget, text in (
+            (self.btn_browse_asm, "Выбрать файл сборки КОМПАС (.a3d)"),
+            (self.btn_load,
+             "Проанализировать сборку: найти все детали, включая\n"
+             "исполнения и локальные (встроенные в сборку)"),
+            (self.btn_browse_out,
+             "Папка, в которую будут сохранены DXF-файлы"),
+            (self.btn_browse_tpl,
+             "Шаблон фрагмента .frw (необязательно): фрагменты\n"
+             "создаются из него — надписи не придётся удалять вручную"),
+            (self.btn_clear_tpl, "Убрать шаблон — используется пустой фрагмент"),
+            (self.btn_add,
+             "Добавить файлы деталей (.m3d) вручную, если обход\n"
+             "сборки не нашёл нужные детали"),
+            (self.btn_select_all, "Отметить все детали в списке"),
+            (self.btn_clear_all, "Снять отметки со всех деталей"),
+            (self.counts_label,
+             "Найдено/выбрано деталей; подробности — при наведении\n"
+             "на строку списка и на заголовок «Тип»"),
+            (self.btn_export, "Экспортировать отмеченные детали в DXF"),
+            (self.btn_continue,
+             "Продолжить после паузы\n(проверьте вид/развертку в КОМПАС)"),
+            (self.btn_skip, "Пропустить текущую деталь без сохранения DXF"),
+            (self.btn_cancel,
+             "Остановить выполнение\n(КОМПАС завершит текущий шаг)"),
+            (self.license_label,
+             "Статус лицензии — нажмите для подробностей "
+             "(«Справка → Лицензия…»)"),
+        ):
+            add_tooltip(widget, text)
 
     # ------------------------------------------------------------------
     # Управление состоянием кнопок
@@ -1966,11 +2568,71 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
 
     def _log_gui(self, level: str, text: str) -> None:
+        """Буфер журнала + вывод в окно журнала, если оно открыто."""
         tag = level if level in ("info", "warning", "error", "ok") else "info"
+        for line in text.splitlines() or [""]:
+            self._log_buffer.append((tag, line))
+        if len(self._log_buffer) > 5000:
+            del self._log_buffer[:-5000]
+        widget = self.log_text
+        if widget is None:
+            return
+        try:
+            if not widget.winfo_exists():
+                self.log_text = None
+                return
+            widget.configure(state="normal")
+            widget.insert("end", text + "\n", tag)
+            widget.see("end")
+            widget.configure(state="disabled")
+        except Exception:
+            self.log_text = None
+
+    def show_log_window(self) -> None:
+        """Окно журнала (меню «Файл → Показать журнал»)."""
+        if (self._log_window is not None
+                and self._log_window.winfo_exists()):
+            self._log_window.deiconify()
+            self._log_window.lift()
+            return
+        win = tk.Toplevel(self)
+        self._log_window = win
+        win.title(f"Журнал — {APP_TITLE}")
+        win.geometry("900x420")
+
+        frm = ttk.Frame(win, padding=(8, 8))
+        frm.pack(fill="both", expand=True)
+        self.log_text = tk.Text(frm, state="disabled", wrap="none",
+                                font=("Consolas", 9))
+        scroll = ttk.Scrollbar(frm, orient="vertical",
+                               command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.log_text.pack(fill="both", expand=True)
+        for tag, color in (("info", "#202020"), ("warning", "#b36b00"),
+                           ("error", "#b00020"), ("ok", "#0a7a30")):
+            self.log_text.tag_configure(tag, foreground=color)
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", text + "\n", tag)
+        for tag, line in self._log_buffer:
+            self.log_text.insert("end", line + "\n", tag)
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+        btns = ttk.Frame(win, padding=(8, 0, 8, 8))
+        btns.pack(fill="x")
+
+        def open_log_file() -> None:
+            try:
+                os.startfile(LOG_FILE)      # noqa: S606 — файл журнала рядом с программой
+            except Exception as exc:
+                messagebox.showerror(APP_TITLE,
+                                     f"Не удалось открыть журнал: {exc}",
+                                     parent=win)
+
+        ttk.Button(btns, text="Открыть файл журнала",
+                   command=open_log_file).pack(side="left")
+        ttk.Button(btns, text="Закрыть",
+                   command=win.destroy).pack(side="right")
 
     def _update_license_label(self) -> None:
         self.license_var.set(self.lic.status_text())
@@ -2019,10 +2681,35 @@ class App(tk.Tk):
                               "используется пустой фрагмент")
 
     def _save_settings(self) -> None:
-        """Сохранить текущие настройки GUI (шаблон, папка вывода)."""
+        """Сохранить текущие настройки GUI (шаблон, папку вывода)."""
         self.settings["template"] = self.tpl_var.get().strip()
         self.settings["out_dir"] = self.out_var.get().strip()
         save_settings(self.settings)
+
+    def on_clear_com_cache(self) -> None:
+        """Сброс кеша COM-обёрток pywin32 (кнопка «Сброс кеша COM»)."""
+        if self._worker_alive():
+            messagebox.showwarning(
+                APP_TITLE, "Дождитесь окончания экспорта — "
+                           "кеш нельзя сбрасывать во время работы.")
+            return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "Удалить кеш COM-обёрток pywin32 (gen_py)?\n\n"
+                "Помогает при ошибках вида\n"
+                "«win32com.gen_py has no attribute …»\n"
+                "после обновления КОМПАС-3D.\n"
+                "Кеш будет заново создан при следующем экспорте."):
+            return
+        removed = clear_com_cache()
+        if removed:
+            self._log_gui("ok", "Кеш COM сброшен:\n" + "\n".join(removed))
+        else:
+            self._log_gui("info", "Кеш COM на диске не найден — "
+                                  "выгружены только модули из памяти")
+        self._log_gui("info", "Заново загрузите детали и повторите "
+                              "экспорт. Если ошибки сохранятся — "
+                              "перезапустите приложение.")
 
     # ------------------------------------------------------------------
     # Загрузка деталей из сборки / вручную
@@ -2078,11 +2765,13 @@ class App(tk.Tk):
 
     def _rebuild_part_list(self, parts: List[PartInfo]) -> None:
         """Полная перестройка списка после обхода сборки."""
+        header = getattr(self, "_list_header", None)
         for widget in self.inner.winfo_children():
-            if widget is not getattr(self, "_list_header", None):
+            if widget is not header:
                 widget.destroy()
-        # Заголовок колонок создаётся заново (он был уничтожен вместе с детьми).
-        self._make_list_header()
+        # Заголовок пересоздаём, только если он был уничтожен.
+        if header is None or not header.winfo_exists():
+            self._make_list_header()
         self.rows.clear()
         self.part_vars.clear()
         ordered = sorted(parts, key=lambda p: (p.marking, p.name, p.file_path))
@@ -2094,11 +2783,18 @@ class App(tk.Tk):
     def _make_list_header(self) -> None:
         header = ttk.Frame(self.inner)
         header.pack(fill="x", padx=2, pady=(0, 2))
-        columns = [("", 4), ("Файл", 40), ("Тип", 13),
-                   ("Обозначение", 18), ("Наименование", 24), ("Статус", 24)]
-        for text, width in columns:
-            ttk.Label(header, text=text, width=width, anchor="w",
-                      font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._list_header = header
+        labels = []
+        for text, width in LIST_COLUMNS:
+            lbl = ttk.Label(header, text=text, width=width, anchor="w",
+                            style="Header.TLabel")
+            lbl.pack(side="left")
+            labels.append(lbl)
+        add_tooltip(labels[2],
+                    "«листовая» без звёздочки — тип подтверждён по API;\n"
+                    "со звёздочкой — оценочный (по материалу),\n"
+                    "уточняется при экспорте")
+        add_tooltip(labels[5], "Результат экспорта детали")
 
     def _append_part_row(self, part: PartInfo, selected: bool = True) -> None:
         """Добавление одной строки в список деталей."""
@@ -2108,20 +2804,30 @@ class App(tk.Tk):
         ttk.Checkbutton(row, variable=var,
                         command=self._update_counts).grid(
                             row=0, column=0, sticky="w")
-        ttk.Label(row, text=os.path.basename(part.file_path),
+        ttk.Label(row, text=part_file_label(part),
                   width=40, anchor="w").grid(row=0, column=1, sticky="w")
         type_lbl = ttk.Label(row, text=part_type_text(part.is_sheet),
                              width=13, anchor="w")
         type_lbl.grid(row=0, column=2, sticky="w")
-        ttk.Label(row, text=part.marking, width=18,
+        marking = part.marking
+        if part.performance:
+            marking = f"{marking} (исп. {part.performance})".strip()
+        ttk.Label(row, text=marking, width=18,
                   anchor="w").grid(row=0, column=3, sticky="w")
         ttk.Label(row, text=part.name, width=24,
                   anchor="w").grid(row=0, column=4, sticky="w")
         status_lbl = ttk.Label(row, text="—", width=24, anchor="w")
         status_lbl.grid(row=0, column=5, sticky="w")
-        self.rows[os.path.normcase(part.file_path)] = {
-            "status": status_lbl, "type": type_lbl}
+        self.rows[part.uid] = {"status": status_lbl, "type": type_lbl}
         self.part_vars.append((var, part))
+        details = (f"Файл: {part.file_path}\n" if part.file_path
+                   else "Локальная деталь (встроена в сборку)\n")
+        details += f"Обозначение: {part.marking}\nНаименование: {part.name}"
+        if part.material:
+            details += f"\nМатериал: {part.material}"
+        if part.performance:
+            details += f"\nИсполнение: {part.performance}"
+        add_tooltip(row, details)
 
     def _toggle_all(self, value: bool) -> None:
         for var, _ in self.part_vars:
@@ -2133,9 +2839,9 @@ class App(tk.Tk):
         chosen = sum(1 for var, _ in self.part_vars if var.get())
         self.counts_var.set(f"Найдено: {total}    Выбрано: {chosen}")
 
-    def _update_part_row(self, file_path: str, status: str,
+    def _update_part_row(self, uid: str, status: str,
                          message: str, is_sheet: Optional[bool]) -> None:
-        row = self.rows.get(os.path.normcase(file_path))
+        row = self.rows.get(uid)
         if row is None:
             return
         text = {"OK": "OK", "ERROR": "ОШИБКА", "SKIP": "ПРОПУСК"}.get(status, "—")
@@ -2202,22 +2908,15 @@ class App(tk.Tk):
                         "Продолжить?"):
                     return
 
-        # Расчёт путей DXF с разрешением коллизий имён в рамках запуска.
-        used_names = set()
-        jobs: List[Tuple[PartInfo, str]] = []
-        for part in selected:
-            base = build_dxf_basename(part)
-            name = base
-            suffix = 2
-            while name.lower() in used_names:
-                name = f"{base} ({suffix})"
-                suffix += 1
-            used_names.add(name.lower())
-            jobs.append((part, os.path.join(out_dir, name + ".dxf")))
-
-        self._log_gui("info", f"Начинаю экспорт: {len(jobs)} дет., папка: {out_dir}")
-        self.progress.configure(value=0, maximum=len(jobs))
-        self._start_worker("export", jobs)
+        # Пути DXF считаются в рабочем потоке: толщина запрашивается
+        # перед каждой деталью, DXF кладётся в подпапку «толщина».
+        self._log_gui(
+            "info",
+            f"Начинаю экспорт: {len(selected)} дет., папка: {out_dir}\n"
+            "Для каждой детали будет запрошена толщина (мм) — DXF "
+            "сохраняется в подпапку с этим номером.")
+        self.progress.configure(value=0, maximum=len(selected))
+        self._start_worker("export", (out_dir, selected))
 
     # ------------------------------------------------------------------
     # Кнопки паузы/отмены
@@ -2249,6 +2948,66 @@ class App(tk.Tk):
             self.resume_event.set()   # если ждём на паузе — разбудить для отмены
             self._set_buttons("working")
             self.status_var.set("Останавливаю…")
+
+    def _show_thickness_dialog(self, part_name: str, default: str) -> None:
+        """
+        Модальный диалог толщины (запрос рабочего потока): число мм ->
+        («ok», значение); «Пропустить деталь» / «Остановить» — как кнопки.
+        """
+        win = tk.Toplevel(self)
+        win.title("Толщина детали")
+        win.geometry("400x190")
+        win.resizable(False, False)
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", lambda: None)   # только по кнопкам
+
+        ttk.Label(win, text=f"Деталь: {part_name}", wraplength=370,
+                  justify="left",
+                  font=("Segoe UI", 10, "bold")).pack(
+                      anchor="w", padx=12, pady=(12, 6))
+        ttk.Label(win,
+                  text="Толщина материала, мм — DXF будет сохранён "
+                       "в подпапку с этим номером:").pack(
+                          anchor="w", padx=12)
+        var = tk.StringVar(value=default or "")
+        entry = ttk.Entry(win, textvariable=var)
+        entry.pack(fill="x", padx=12, pady=(4, 8))
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        def answer(result: Tuple[str, str]) -> None:
+            if self.worker is not None:
+                self.worker.thickness_result = result
+                self.worker.thickness_event.set()
+            if result[0] == "cancel":
+                self.cancel_event.set()
+                self.status_var.set("Останавливаю…")
+            win.destroy()
+
+        def on_ok() -> None:
+            value = var.get().strip().replace(",", ".")
+            if not re.fullmatch(r"\d+(\.\d+)?", value):
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Введите толщину числом в миллиметрах,\n"
+                    "например 4 или 4.5", parent=win)
+                return
+            answer(("ok", value))
+
+        def on_skip() -> None:
+            answer(("skip", ""))
+
+        def on_stop() -> None:
+            answer(("cancel", ""))
+
+        entry.bind("<Return>", lambda _e: on_ok())
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(btns, text="ОК", command=on_ok).pack(side="left")
+        ttk.Button(btns, text="Пропустить деталь",
+                   command=on_skip).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Остановить",
+                   command=on_stop).pack(side="right")
 
     # ------------------------------------------------------------------
     # Обработка сообщений рабочего потока
@@ -2284,8 +3043,13 @@ class App(tk.Tk):
                 f"{msg.get('title', '')}\n\n{msg.get('instruction', '')}\n\n"
                 ">>> ЖДЁМ ВАШЕГО ДЕЙСТВИЯ <<<")
 
+        elif mtype == "ASK_THICKNESS":
+            # Модальный запрос толщины детали (до её экспорта).
+            self._show_thickness_dialog(msg.get("part", ""),
+                                        msg.get("default", ""))
+
         elif mtype == "PART_UPDATE":
-            self._update_part_row(msg.get("file_path", ""),
+            self._update_part_row(msg.get("uid", ""),
                                   msg.get("status", "—"),
                                   msg.get("message", ""),
                                   msg.get("is_sheet"))
@@ -2322,8 +3086,21 @@ class App(tk.Tk):
             messagebox.showerror(APP_TITLE, msg.get("text", ""))
 
     # ------------------------------------------------------------------
-    # Диалог лицензии
+    # Диалог лицензии и справка
     # ------------------------------------------------------------------
+
+    def show_instructions(self) -> None:
+        """Меню «Справка → Инструкция»: порядок работы."""
+        messagebox.showinfo(f"Инструкция — {APP_TITLE}", STARTUP_INSTRUCTIONS)
+
+    def show_about(self) -> None:
+        """Меню «Справка → О программе»."""
+        messagebox.showinfo(
+            f"О программе — {APP_TITLE}",
+            f"{APP_TITLE}\n\n"
+            "Пакетный экспорт деталей сборки КОМПАС-3D в DXF 1:1 (мм),\n"
+            "включая исполнения и локальные детали (встроенные в сборку).\n\n"
+            f"{VENDOR} — {SUPPORT_EMAIL}")
 
     def show_license_dialog(self) -> None:
         """Окно лицензии: статус, HWID для заказа, подключение license.key."""
