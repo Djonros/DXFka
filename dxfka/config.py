@@ -9,7 +9,7 @@ import tempfile
 # КОНСТАНТЫ: приложение, брендинг
 # ======================================================================
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.0.1"
 APP_TITLE = "DXFka — Экспорт DXF из КОМПАС-3D"
 VENDOR = "Djonros"
 SUPPORT_EMAIL = "djonros@gmail.com"
