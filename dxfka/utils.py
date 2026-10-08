@@ -175,30 +175,98 @@ def thickness_from_material(material: str) -> str:
     return f"{value:.3f}".rstrip("0").rstrip(".")
 
 
+# Сущности DXF, которые составляют контур детали.
+DXF_GEOMETRY = frozenset((
+    "LINE", "ARC", "CIRCLE", "ELLIPSE", "LWPOLYLINE", "POLYLINE", "VERTEX",
+    "SEQEND", "SPLINE"))
+# Оформление вида, которое из DXF удаляется: подпись масштаба «(1:1)»,
+# надписи, размеры, выноски, штриховки.
+DXF_ANNOTATIONS = frozenset((
+    "TEXT", "MTEXT", "ATTDEF", "DIMENSION", "LEADER", "MLEADER",
+    "MULTILEADER", "TOLERANCE", "HATCH"))
+
+
+def _read_dxf_lines(path: str) -> Optional[List[str]]:
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    return data.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+
+
+def _dxf_entities(lines: List[str]):
+    """
+    Сущности секции ENTITIES: (тип, первая строка, строка после конца,
+    [(код, значение), ...]). Код и значение — пары строк файла.
+    """
+    in_entities = False
+    current = None
+    for i in range(0, len(lines) - 1, 2):
+        code, value = lines[i].strip(), lines[i + 1].strip()
+        if code == "0":
+            if current is not None:
+                current[2] = i
+                yield tuple(current)
+                current = None
+            if value == "ENDSEC":
+                in_entities = False
+            elif in_entities:
+                current = [value, i, None, []]
+        elif code == "2" and value == "ENTITIES" and current is None:
+            in_entities = True
+        elif current is not None:
+            current[3].append((code, value))
+
+
 def dxf_extent_area(path: str) -> float:
     """
-    Площадь габарита геометрии DXF (по координатам 10/20 и 11/21
-    в секции ENTITIES); 0 — файл пуст/не читается.
+    Площадь габарита контура DXF (координаты 10/20 и 11/21 сущностей
+    геометрии в секции ENTITIES); 0 — контура нет или файл не читается.
     """
-    try:
-        with open(path, "r", encoding="latin-1") as fh:
-            lines = [line.strip() for line in fh]
-    except OSError:
+    lines = _read_dxf_lines(path)
+    if lines is None:
         return 0.0
     xs: List[float] = []
     ys: List[float] = []
-    in_entities = False
-    for i in range(0, len(lines) - 1, 2):
-        code, value = lines[i], lines[i + 1]
-        if code == "2" and value == "ENTITIES":
-            in_entities = True
-        elif code == "0" and value == "ENDSEC":
-            in_entities = False
-        elif in_entities and code in ("10", "11", "20", "21"):
-            try:
-                (xs if code in ("10", "11") else ys).append(float(value))
-            except ValueError:
-                pass
+    for kind, _, _, pairs in _dxf_entities(lines):
+        if kind not in DXF_GEOMETRY:
+            continue
+        for code, value in pairs:
+            if code in ("10", "11", "20", "21"):
+                try:
+                    (xs if code in ("10", "11") else ys).append(float(value))
+                except ValueError:
+                    pass
     if not xs or not ys:
         return 0.0
     return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+
+def dxf_geometry_count(path: str) -> int:
+    """Число сущностей контура в ENTITIES (0 — в DXF нет детали)."""
+    lines = _read_dxf_lines(path)
+    if lines is None:
+        return 0
+    return sum(1 for kind, _, _, _ in _dxf_entities(lines)
+               if kind in DXF_GEOMETRY and kind not in ("VERTEX", "SEQEND"))
+
+
+def strip_dxf_annotations(path: str) -> int:
+    """
+    Удалить из DXF всё, кроме контура: надписи (в т.ч. масштаб вида
+    «(1:1)»), размеры, выноски, штриховки. Возвращает число удалённых
+    сущностей; остальной файл не меняется.
+    """
+    lines = _read_dxf_lines(path)
+    if lines is None:
+        return 0
+    drop = [(start, end) for kind, start, end, _ in _dxf_entities(lines)
+            if kind in DXF_ANNOTATIONS]
+    if not drop:
+        return 0
+    for start, end in reversed(drop):
+        del lines[start:end]
+    with open(path, "wb") as fh:
+        fh.write("".join(lines).encode("utf-8", "surrogateescape"))
+    return len(drop)

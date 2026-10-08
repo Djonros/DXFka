@@ -15,8 +15,9 @@ from dxfka.kompas.connection import KompasConnection
 from dxfka.kompas.walker import AssemblyWalker
 from dxfka.models import CancelledByUser, PartInfo, SkippedByUser
 from dxfka.utils import (
-    com_count, com_item, com_items, dxf_extent_area, safe_str,
-    sanitize_filename, thickness_from_material)
+    com_count, com_item, com_items, dxf_extent_area, dxf_geometry_count,
+    safe_str, sanitize_filename, strip_dxf_annotations,
+    thickness_from_material)
 
 # ======================================================================
 # ЭКСПОРТ ОДНОЙ ДЕТАЛИ В DXF
@@ -321,12 +322,25 @@ class PartExporter:
             # DXF определяются настройками КОМПАС (Параметры -> Совместимость ->
             # форматы обмена). Требуемый профиль: ASCII, мм — настройте в КОМПАС.
             save_result = i_document2d.ksSaveToDXF(dxf_path)
-            if save_result and os.path.isfile(dxf_path) \
-                    and os.path.getsize(dxf_path) > 0:
-                size = os.path.getsize(dxf_path)
-                return view_ref, True, f"DXF создан ({size:,} байт)".replace(",", " ")
-            return view_ref, False, \
-                f"ksSaveToDXF вернул {save_result}, файл DXF не создан"
+            if not (save_result and os.path.isfile(dxf_path)
+                    and os.path.getsize(dxf_path) > 0):
+                return view_ref, False, \
+                    f"ksSaveToDXF вернул {save_result}, файл DXF не создан"
+
+            # 9) В DXF остаётся только контур: подпись масштаба «(1:1)» и
+            #    прочие надписи вида удаляются. Успех — по наличию
+            #    геометрии, а не по размеру файла (пустой DXF ~600 КБ).
+            removed = strip_dxf_annotations(dxf_path)
+            if removed:
+                self.log("info", f"Из DXF удалены надписи: {removed}")
+            count = dxf_geometry_count(dxf_path)
+            if not count:
+                try:
+                    os.remove(dxf_path)
+                except OSError:
+                    pass
+                return view_ref, False, "В DXF нет контура детали (вид пуст)"
+            return view_ref, True, f"DXF создан (элементов контура: {count})"
 
         except (CancelledByUser, SkippedByUser):
             raise  # «Отмена»/«Пропустить» на паузе — не ошибка, пробрасываем
@@ -626,6 +640,12 @@ class PartExporter:
                              f"проекцию «{FLAT_PROJECTION_NAME}» от исходного файла")
                     _, ok, message = self._build_fragment_view(
                         part.file_path, FLAT_PROJECTION_NAME, dxf_path, pause)
+                if not ok and self.detected_thickness:
+                    # Плоская деталь без гибов: развёртка = сама пластина.
+                    self.log("warning", "Развертка не дала контур — беру "
+                             "проекцию детали с наибольшим габаритом")
+                    ok, message = self._export_largest_projection(
+                        part.file_path, stem, dxf_path)
                 state["ok"] = ok
                 return ("OK" if ok else "ERROR"), message
 
