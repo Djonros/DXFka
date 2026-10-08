@@ -640,12 +640,10 @@ class PartExporter:
                              f"проекцию «{FLAT_PROJECTION_NAME}» от исходного файла")
                     _, ok, message = self._build_fragment_view(
                         part.file_path, FLAT_PROJECTION_NAME, dxf_path, pause)
-                if not ok and self.detected_thickness:
-                    # Плоская деталь без гибов: развёртка = сама пластина.
-                    self.log("warning", "Развертка не дала контур — беру "
-                             "проекцию детали с наибольшим габаритом")
-                    ok, message = self._export_largest_projection(
-                        part.file_path, stem, dxf_path)
+                if not ok:
+                    # Вид вместо развёртки не подставляем: у гнутой детали
+                    # он дал бы неверную заготовку.
+                    message = f"Развертка не построена: {message}"
                 state["ok"] = ok
                 return ("OK" if ok else "ERROR"), message
 
